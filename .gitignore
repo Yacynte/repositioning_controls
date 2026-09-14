@@ -8,8 +8,8 @@ data/*
 !data/imagesGT4/
 !data/imagesGT4/**
 
-!data/groundTruth4/
-!data/groundTruth4/**
+!data/groundTruths4/
+!data/groundTruths4/**
 
 # Ignore logs completely
 logs*
