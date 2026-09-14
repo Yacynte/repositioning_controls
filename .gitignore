@@ -1,3 +1,5 @@
 .venv
 data*
 logs*
+!data/imagesGT4
+!data/groundTruth4
