@@ -1,5 +1,15 @@
+# Ignore virtual environment directories
 .venv
-data*
+
+# Ignore everything inside the data directory by default
+data/*
+
+# But explicitly allow these specific subfolders and their contents
+!data/imagesGT4/
+!data/imagesGT4/**
+
+!data/groundTruth4/
+!data/groundTruth4/**
+
+# Ignore logs completely
 logs*
-!data/imagesGT4
-!data/groundTruth4
