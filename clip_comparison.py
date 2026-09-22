@@ -12,13 +12,18 @@ import torch.nn.functional as F
 # Configuration
 # ============================================================
 
-GT_DIR = Path("data/imagesGT3")
-RESULTS_DIR = Path("data/results3_0")
-OUTPUT_FILE = Path("data/results3_0/similarity_results.yaml")
+GT_DIR = Path("data/imagesGT4")
+RESULTS_DIR = Path("data/results4_0")
+OUTPUT_FILE = Path("data/results4_0/similarity_results.yaml")
 
 WEATHER_FOLDERS = ["rain", "sunny", "snow"]
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+# Filename prefix of the image captured BEFORE repositioning starts, e.g.
+# "Start1_Capture_20260911_135900.png". Stored next to the Final images in
+# RESULTS_DIR/<weather>/. Images are matched to a GT by their integer ID.
+START_PREFIX = "Start"
 
 
 # ============================================================
@@ -69,6 +74,27 @@ def get_final_id(filename):
         return None
 
     return int(match.group(1))
+
+
+def get_prefixed_id(filename, prefix):
+    """
+    Extract the integer ID from '<prefix><id>_Capture_...' (None if no match).
+    """
+
+    match = re.match(rf"^{re.escape(prefix)}(\d+)_Capture_", filename)
+
+    if match is None:
+        return None
+
+    return int(match.group(1))
+
+
+def same_file(path1, path2):
+    """
+    True if both files are byte-identical (catches a GT copied in as 'start').
+    """
+
+    return path1.read_bytes() == path2.read_bytes()
 
 
 def load_image(path):
@@ -143,6 +169,7 @@ print(f"Found {len(gt_images)} GT images.")
 print("\nScanning result images...")
 
 final_images = {}
+start_images = {}
 
 for weather in WEATHER_FOLDERS:
 
@@ -160,10 +187,18 @@ for weather in WEATHER_FOLDERS:
         if path.suffix.lower() not in IMAGE_EXTENSIONS:
             continue
 
+        start_id = get_prefixed_id(path.name, START_PREFIX)
+
+        if start_id is not None:
+            start_images[start_id] = path
+            continue
+
         image_id = get_final_id(path.name)
 
         if image_id is None:
-            print(f"WARNING: Could not parse Final ID: {path}")
+            # GT copies etc. living in the results folder are not results.
+            if get_gt_id(path.name) is None:
+                print(f"WARNING: Could not parse Final ID: {path}")
             continue
 
         if image_id in final_images:
@@ -179,7 +214,8 @@ for weather in WEATHER_FOLDERS:
         }
 
 
-print(f"Found {len(final_images)} result images.")
+print(f"Found {len(final_images)} result images "
+      f"and {len(start_images)} pre-repositioning ('{START_PREFIX}') images.")
 
 
 # ============================================================
@@ -229,30 +265,55 @@ for index, image_id in enumerate(matching_ids, start=1):
         f"ID {image_id} | {weather}"
     )
 
-    similarity = scene_similarity(
-        gt_path,
-        final_path
-    )
+    final_sim = scene_similarity(gt_path, final_path)
 
-    print(f"    Similarity: {similarity:.6f}")
-
-    results.append({
+    pair = {
         "id": image_id,
 
-        "source": {
+        "ground_truth": {
             "filename": gt_path.name,
             "path": str(gt_path),
-            "weather": "ground_truth",
         },
 
-        "target": {
+        "start": None,
+
+        "final": {
             "filename": final_path.name,
             "path": str(final_path),
             "weather": weather,
+            "similarity_to_gt": round(final_sim, 6),
         },
+    }
 
-        "similarity": round(similarity, 6),
-    })
+    start_path = start_images.get(image_id)
+
+    if start_path is None:
+        print(f"    WARNING: no '{START_PREFIX}{image_id}_Capture_*' image")
+    else:
+        if same_file(gt_path, start_path):
+            print("    WARNING: start image is identical to the GT image")
+
+        start_sim = scene_similarity(gt_path, start_path)
+
+        pair["start"] = {
+            "filename": start_path.name,
+            "path": str(start_path),
+            "similarity_to_gt": round(start_sim, 6),
+        }
+
+        # > 0 means repositioning made the view more similar to the GT
+        pair["improvement"] = round(final_sim - start_sim, 6)
+
+        print(f"    Start similarity: {start_sim:.6f}")
+        print(f"    Improvement:      {final_sim - start_sim:+.6f}")
+
+    print(f"    Final similarity: {final_sim:.6f}")
+
+    results.append(pair)
+
+
+def mean(values):
+    return round(sum(values) / len(values), 6) if values else None
 
 
 # ============================================================
@@ -266,6 +327,14 @@ output = {
     "target_directory": str(RESULTS_DIR),
     "weather_conditions": WEATHER_FOLDERS,
     "number_of_pairs": len(results),
+    "summary": {
+        "mean_start_similarity": mean(
+            [r["start"]["similarity_to_gt"] for r in results if r["start"]]),
+        "mean_final_similarity": mean(
+            [r["final"]["similarity_to_gt"] for r in results]),
+        "mean_improvement": mean(
+            [r["improvement"] for r in results if "improvement" in r]),
+    },
     "pairs": results,
 }
 

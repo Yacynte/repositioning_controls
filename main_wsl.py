@@ -6,6 +6,7 @@ import subprocess
 import os
 import glob
 import random
+import copy
 
 # Use a container class to ensure we are modifying the same object
 class KeyState:
@@ -105,7 +106,14 @@ async def send_commands():
                             {"x": 330023.0, "y": -80363.0, "z": -175000.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0, "rel_roll": 0.0, "rel_pitch": -10.0, "rel_yaw": 10.0},
                             {"x": -330023.0, "y": 35277.0, "z": -178000.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0, "rel_roll": 0.0, "rel_pitch": 0.0, "rel_yaw": 0.0}]
     
-    
+
+    # Set how many times you want the pattern to repeat (e.g., 3 times to get 6 items total)
+    repetitions = 5
+
+    # Replicate safely using a list comprehension and deepcopy
+    target_locations = [copy.deepcopy(item) for _ in range(repetitions) for item in target_locations]
+
+
     # ctrl.start_stream(True)
     # ctrl.start_receiving_controls()
 
