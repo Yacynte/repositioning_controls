@@ -34,7 +34,7 @@ import torch.nn.functional as F
 # identifies the GT target set; TEST_INDEX picks which motionLog/results
 # run against that set (the "_N" suffix). Edit both per run.
 RUN_INDEX = "4"
-TEST_INDEX = "1"
+TEST_INDEX = "16"
 
 # Ground-truth capture images, e.g. GT1_Capture_20260628_154039.png
 GT_DIR = Path(f"data/groundTruths{RUN_INDEX}/imagesGT{RUN_INDEX}")
