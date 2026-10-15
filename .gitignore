@@ -4,12 +4,55 @@
 # Ignore everything inside the data directory by default
 data/*
 
-# But explicitly allow these specific subfolders and their contents
-!data/imagesGT4/
-!data/imagesGT4/**
+# But keep the evaluation results. Git cannot re-include a file inside an ignored folder, so every
+# parent folder is re-included and then its other contents ignored again, one level at a time.
 
-!data/groundTruths4/
-!data/groundTruths4/**
+# --- finalMotion: results document, summaries, summary figures
+!data/finalMotion/
+data/finalMotion/*
+!data/finalMotion/RESULTS.md
+!data/finalMotion/analysis/
+data/finalMotion/analysis/*
+!data/finalMotion/analysis/results.json
+!data/finalMotion/analysis/summary.md
+!data/finalMotion/analysis/summary.csv
+!data/finalMotion/analysis/trials.csv
+!data/finalMotion/analysis/figures/
 
-# Ignore logs completely
-/logs*
+# --- finalMotion: GT4 example (target image + pose, base-set per-trial figures)
+!data/finalMotion/GroundTruth/
+data/finalMotion/GroundTruth/*
+!data/finalMotion/GroundTruth/GT4_*/
+data/finalMotion/GroundTruth/GT4_*/*
+!data/finalMotion/GroundTruth/GT4_*/rgb.png
+!data/finalMotion/GroundTruth/GT4_*/meta.json
+!data/finalMotion/analysis/trials/
+data/finalMotion/analysis/trials/*
+!data/finalMotion/analysis/trials/5_05/
+data/finalMotion/analysis/trials/5_05/*
+!data/finalMotion/analysis/trials/5_05/GT4_*
+
+# --- motionLog5_03: results document, summaries, summary figures, GT4 per-trial figures
+!data/motionLog5_03/
+data/motionLog5_03/*
+!data/motionLog5_03/RESULTS1.md
+!data/motionLog5_03/analysis1/
+data/motionLog5_03/analysis1/*
+!data/motionLog5_03/analysis1/results.json
+!data/motionLog5_03/analysis1/summary.md
+!data/motionLog5_03/analysis1/summary.csv
+!data/motionLog5_03/analysis1/trials.csv
+!data/motionLog5_03/analysis1/figures/
+!data/motionLog5_03/analysis1/trials/
+data/motionLog5_03/analysis1/trials/*
+!data/motionLog5_03/analysis1/trials/5_03_sunny/
+data/motionLog5_03/analysis1/trials/5_03_sunny/*
+!data/motionLog5_03/analysis1/trials/5_03_sunny/GT4_*
+
+# Ignore logs completely (also covers run folders like /logData5_05fog)
+/log*
+/finalMotion.zip
+
+# Python bytecode
+__pycache__/
+*.pyc

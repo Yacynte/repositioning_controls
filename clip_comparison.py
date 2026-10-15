@@ -33,17 +33,17 @@ import torch.nn.functional as F
 # groundTruths4/imagesGT4, motionLog4_0, motionLog4_1, results4_1. RUN_INDEX
 # identifies the GT target set; TEST_INDEX picks which motionLog/results
 # run against that set (the "_N" suffix). Edit both per run.
-RUN_INDEX = "4"
-TEST_INDEX = "16"
+RUN_INDEX = "5"
+TEST_INDEX = "05"
 
 # Ground-truth capture images, e.g. GT1_Capture_20260628_154039.png
-GT_DIR = Path(f"data/groundTruths{RUN_INDEX}/imagesGT{RUN_INDEX}")
-
+# GT_DIR = Path(f"data/groundTruths{RUN_INDEX}/imagesGT{RUN_INDEX}")
+GT_DIR = Path(f"data/finalMotion/groundTruths{RUN_INDEX}/imagesGT{RUN_INDEX}")
 # Ground-truth motion logs, logged at the same targets as GT_DIR. Named
 # MotionLog_{id}_*.csv (older runs: GT{id}_MotionLog_*.csv). The last row
 # of each log is taken as the target pose.
 GT_MOTION_DIR = Path(f"data/groundTruths{RUN_INDEX}")
-
+GT_MOTION_DIR = Path(f"data/groundTruths{RUN_INDEX}")
 # One subfolder per weather condition, e.g. data/motionLog4_1/sunny/. Each
 # weather folder holds MotionLog_<trial>_<timestamp>.csv files directly in
 # it, plus an images/ subfolder with the paired
