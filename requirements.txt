@@ -12,3 +12,5 @@ ftfy
 regex
 tqdm
 clip @ git+https://github.com/openai/CLIP.git
+opencv-python
+lightglue @ git+https://github.com/cvg/LightGlue.git

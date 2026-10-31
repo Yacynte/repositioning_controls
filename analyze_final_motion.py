@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Final-pose accuracy and convergence analysis for the data/finalMotion trial sets.
+Final-pose accuracy, convergence and image-similarity analysis for the finalMotion trial sets
+(simulation) and the real-drone runs.
 
 Layout (one trial set = one logData/motion pair, e.g. "5_05", "5_05fog", ...):
 
@@ -28,24 +29,36 @@ Per trial
    the MotionLog against the GT pose, and the field-of-view overlap = fraction of GT image
    pixels (GT depth, sky at infinity) that are inside the start camera's image.
 5. Error over time: the camera pose from every MotionLog row against the GT pose.
-6. CLIP scene similarity (same model and cosine score as clip_comparison.py) of the
-   Start and End captures (logData<set>/images/image{Start,End}<ts>.png) and of the
-   Final snapshot rgb.png against the GT rgb.png.
+6. Image similarity (repositioning_score.py, TwoStageScorer) of the Start and End captures
+   (logData<set>/images/image{Start,End}<ts>.png) and of the Final snapshot rgb.png against
+   the GT rgb.png: DINOv2 global similarity + SuperPoint/LightGlue overlap and alignment,
+   combined into one score in [0, 1], and the pixel error = median distance between the
+   inlier matches in pixels (comparable across simulation and drone, all 1920x1080).
 
 Per set: success rate, time, and mean / SD / RMSE / median / max of alpha, |t|, |t*|,
-|eps|, eps_lat, eps_fwd, CLIP scores, ... (settled trials and all trials).
+|eps|, eps_lat, eps_fwd, image scores, ... (settled trials and all trials).
+
+Real-drone runs (same image score; the pose metrics above need simulator ground truth):
+    <root>/LogDataDrone/<weather>/<run>/   log_*.txt, dataLog_*.csv, images/image{Start,End}*.png
+    <root>/motionDrone/<weather>/<run>/    motion_log_*.csv, [rgb.jpg = final snapshot]
+    <root>/GroundTruthDrone/               gerolfing.json, targets/, <place>/GT*.png + motion log
+    Target of a run: idx<k> -> gerolfing.json entry k; else GroundTruthDrone/<run name without
+    trailing digits>/; else the target file named in the run's log. The camera's burned-in
+    on-screen overlay is excluded from the feature matching (DRONE_OVERLAY_BOXES).
 
 Outputs in --out (default <root>/analysis):
     results.json   everything: definitions, GT snapshots, per-set statistics, per-trial
                    results incl. the error-over-time curve
     trials.csv, summary.csv, summary.md, figures/*.png
-    trials/<set>/GT<k>_<ts>_{images,translation,rotation}.png   (clip_comparison.py's
-                   GT | Start | End panel and path-vs-GT plots, one set per trial)
+    trials/<set>/GT<k>_<ts>_{images,translation,rotation}.png   (GT | Start | End panel with
+                   the image scores and path-vs-GT plots, one set per trial)
+    drone/<weather>/<run>_{images,algorithm,camera_rotation,drone_rotation,translation}.png
 
-Usage:
-    python analyze_final_motion.py
-    python analyze_final_motion.py --root data/finalMotion --sets 5_05 5_05fog
-    python analyze_final_motion.py --no-clip
+Usage (from controls/):
+    python analyze_final_motion.py                    # everything
+    python analyze_final_motion.py --mode plots       # analysis + plots, image scores from cache
+    python analyze_final_motion.py --mode images      # only image comparison + image panels
+    python analyze_final_motion.py --sets 5_05 5_05fog --no-drone
 """
 
 import argparse
@@ -70,7 +83,7 @@ import rt_ambiguity_analysis as rt
 # Configuration
 # ============================================================
 
-ROOT = Path("data/finalMotion")
+ROOT = Path("finalMotion")
 BASE_SET = "5_05"
 
 # Display names, in plotting order. Sets found on disk but missing here go last.
@@ -94,7 +107,17 @@ SET_LABELS = {
 DENSE_STRIDE = 4         # pixel stride for dense depth sampling (overlap, fallback t*)
 MOTION_STEP = 5          # use every n-th MotionLog row for the error-over-time curves
 META_MISMATCH_CM = 5.0   # Final meta.json vs last MotionLog pose; above this the meta is stale
-CLIP_MODEL = "ViT-B/32"  # as in clip_comparison.py
+IMAGE_SCORE = "repositioning_score.TwoStageScorer (DINOv2 + SuperPoint/LightGlue)"
+
+# Burned-in on-screen overlay of the drone camera stream, (x0, y0, x1, y1) in normalised image
+# coordinates (measured on 1920x1080 frames, ~15 px margin): grey info box, "Live Stream" box,
+# Workswell logo. Feature matches inside these boxes are ignored for the drone runs.
+DRONE_OVERLAY_BOXES = [(0.0, 0.0, 1340 / 1920, 320 / 1080),
+                       (1345 / 1920, 0.0, 1.0, 125 / 1080),
+                       (1530 / 1920, 990 / 1080, 1.0, 1.0)]
+TRUNCATION_MARGIN_ROWS = 8  # rows dropped above the cut of a truncated (incompletely copied) PNG
+DRONE_ATT_ROLL, DRONE_ATT_PITCH, DRONE_ATT_YAW = 0, 1, 2  # order of gerolfing angle triplets
+EARTH_RADIUS_M = 6378137.0
 
 # dataLog rot_error_{x,y,z} -> GT CV frame rotation vector: cv = sign * est[perm]
 # (fitted over all 48 signed axis permutations; the same mapping wins for every run)
@@ -191,35 +214,124 @@ class GroundTruth:
 
 
 # ============================================================
-# CLIP
+# Image similarity (repositioning_score.py)
 # ============================================================
 
-class ClipScorer:
-    """Cosine similarity of CLIP image embeddings (clip_comparison.scene_similarity), cached per file."""
+def load_rgb(path):
+    """
+    (RGB array, valid rows, truncated?). A truncated PNG (incomplete copy off the drone) decodes
+    only down to some row and the rest is black; the valid height is where that block starts.
+    """
+    from PIL import ImageFile
+    try:
+        arr = np.asarray(Image.open(path).convert("RGB"))
+        return arr, arr.shape[0], False
+    except OSError:
+        pass
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    try:
+        arr = np.asarray(Image.open(path).convert("RGB"))
+    finally:
+        ImageFile.LOAD_TRUNCATED_IMAGES = False
+    nonblack = np.flatnonzero(arr.reshape(arr.shape[0], -1).any(axis=1))
+    valid = int(nonblack[-1]) + 1 if len(nonblack) else 0
+    return arr, max(valid - TRUNCATION_MARGIN_ROWS, 0), True
 
-    def __init__(self, model_name=CLIP_MODEL):
-        import torch
-        import clip
-        self.torch = torch
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"CLIP {model_name} on {self.device}")
-        self.model, self.preprocess = clip.load(model_name, device=self.device)
-        self.model.eval()
-        self.cache = {}
 
-    def embed(self, path):
-        key = str(Path(path).resolve())
-        if key not in self.cache:
-            img = self.preprocess(Image.open(path).convert("RGB")).unsqueeze(0).to(self.device)
-            with self.torch.no_grad():
-                f = self.model.encode_image(img).float()
-            self.cache[key] = self.torch.nn.functional.normalize(f, dim=-1)
-        return self.cache[key]
+class ImageScorer:
+    """
+    repositioning_score.TwoStageScorer: DINOv2 global similarity + SuperPoint/LightGlue overlap
+    and alignment, combined into one score in [0, 1], plus the pixel error = median distance
+    between the RANSAC-inlier matches of the two images, in pixels of the query image.
 
-    def similarity(self, path1, path2):
-        if path1 is None or path2 is None or not Path(path1).exists() or not Path(path2).exists():
-            return np.nan
-        return float((self.embed(path1) @ self.embed(path2).T).item())
+    Scores are cached in <out>/image_scores.json (keyed by both files and the overlay mask), so
+    a later run can reuse them without loading the models. compute=False only reads the cache.
+    A truncated image is scored on the rows it has, with the target cropped to the same rows.
+    """
+
+    KEYS = ("combined", "global", "overlap", "alignment", "inliers", "median_disp_norm")
+
+    def __init__(self, out_dir, compute=True):
+        self.out_dir = Path(out_dir)
+        self.cache_file = self.out_dir / "image_scores.json"
+        self.cache = json.loads(self.cache_file.read_text()) if self.cache_file.exists() else {}
+        self.compute = compute
+        self.scorer = None
+
+    def _model(self):
+        if self.scorer is None:
+            import torch
+            try:
+                from repositioning_score import TwoStageScorer
+            except ImportError as e:
+                raise SystemExit(
+                    f"Image comparison needs repositioning_score.py's packages ({e}).\n"
+                    "Install them:  pip install opencv-python \"git+https://github.com/cvg/LightGlue.git\"\n"
+                    "or run without image scoring:  python analyze_final_motion.py --mode plots")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"Image score: {IMAGE_SCORE} on {device}")
+            self.scorer = TwoStageScorer(device)
+        return self.scorer
+
+    def _crop(self, path, rows):
+        d = self.out_dir / "image_cache"
+        d.mkdir(parents=True, exist_ok=True)
+        out = d / f"{Path(path).parent.name}_{Path(path).stem}_top{rows}.png"
+        if not out.exists():
+            Image.fromarray(load_rgb(path)[0][:rows]).save(out)
+        return str(out)
+
+    @staticmethod
+    def _key(target, query, exclude):
+        f = lambda x: Path(x).resolve().as_posix()
+        return f"{f(target)}|{f(query)}|{'overlay' if exclude else 'full'}"
+
+    def score(self, target, query, exclude=None):
+        """Dict of KEYS + px_error + crop_rows, or None (missing image / not cached in plots mode)."""
+        if target is None or query is None or not Path(target).exists() or not Path(query).exists():
+            return None
+        key = self._key(target, query, exclude)
+        if key in self.cache:
+            return self.cache[key]
+        if not self.compute:
+            return None
+        _, ht, trunc_t = load_rgb(target)
+        qa, hq, trunc_q = load_rgb(query)
+        t, q, rows = str(target), str(query), None
+        if trunc_t or trunc_q:
+            rows = min(ht, hq)
+            t, q = self._crop(target, rows), self._crop(query, rows)
+        model = self._model()
+        res, (pt, pq, img_t, img_q) = model.score(t, q, exclude=exclude)
+        out = {k: float(res[k]) for k in self.KEYS}
+        if res["inliers"] >= model.min_inliers:
+            size_t = np.array(img_t.shape[-2:][::-1], float)  # (W, H)
+            size_q = np.array(img_q.shape[-2:][::-1], float)
+            d = np.linalg.norm(pt / size_t * size_q - pq, axis=1)  # target points in query pixels
+            out["px_error"] = float(np.median(d))
+        else:
+            out["px_error"] = float("nan")
+        out["crop_rows"] = rows
+        self.cache[key] = out
+        return out
+
+    def save(self):
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_file.write_text(json.dumps(jsonable(self.cache), indent=1))
+
+
+def add_image_scores(row, scorer, target, images, exclude=None):
+    """row[img_<name>] = combined score, row[img_<name>_<part>] = components; img_gain = end - start."""
+    for name, path in images.items():
+        res = scorer.score(target, path, exclude) if scorer is not None else None
+        row[f"img_{name}"] = np.nan if res is None else res["combined"]
+        for k in ("global", "overlap", "alignment", "inliers", "median_disp_norm", "px_error"):
+            v = None if res is None else res.get(k)
+            row[f"img_{name}_{'px' if k == 'px_error' else k}"] = np.nan if v is None else v
+        if res is not None and res["crop_rows"]:
+            row[f"img_{name}_crop_rows"] = res["crop_rows"]
+    if "start" in images and "end" in images:
+        row["img_gain"] = row["img_end"] - row["img_start"]
 
 
 def load_ground_truths(root):
@@ -428,7 +540,7 @@ def analyze_trial(tr, gt, settle_px):
         m, track = rotation_tracking(dl, ml, gt)
         row.update(m)
 
-    # clip_comparison.py's pose errors: last MotionLog row vs last GT MotionLog row (UE world)
+    # pose errors as in clip_comparison.py: last MotionLog row vs last GT MotionLog row (UE world)
     gt_end, end = pd.read_csv(gt.path / "MotionLog.csv").iloc[-1], ml.iloc[-1]
     for axis in ("X", "Y", "Z"):
         row[f"ue_pos_err_{axis.lower()}_cm"] = float(end[f"Pos{axis}"] - gt_end[f"Pos{axis}"])
@@ -512,7 +624,10 @@ def analyze_trial(tr, gt, settle_px):
 STAT_COLS = ["alpha_deg", "t_cm", "t_lat_cm", "t_star_cm", "t_star_lat_cm", "eps_cm", "eps_lat_cm",
              "eps_fwd_cm", "eps_lat_px", "deadband_cm", "Z_harm_m", "rms_px_final", "est_rot_deg",
              "duration_s", "start_trans_cm", "start_rot_deg", "start_overlap",
-             "clip_start", "clip_end", "clip_gain", "clip_final_rgb",
+             "img_start", "img_end", "img_gain", "img_final",
+             "img_start_px", "img_end_px", "img_final_px",
+             "img_start_global", "img_end_global", "img_start_overlap", "img_end_overlap",
+             "img_start_alignment", "img_end_alignment",
              "rot_est_err_all_deg", "rot_est_err_conv_deg", "rot_est_err_conv_rmse_deg",
              "rot_est_held_frac", "rot_est_held_frac_conv", "rot_est_step_conv_deg"]
 
@@ -530,13 +645,22 @@ DEFINITIONS = {
     "rms_px_final": "RMS reprojection displacement of the GT points in the final camera, px",
     "est_rot_deg": "rotation error the algorithm estimated at the stop (last dataLog row), deg",
     "start_overlap": "fraction of GT image pixels inside the start camera's image (sky at infinity)",
-    "clip_start": f"CLIP {CLIP_MODEL} cosine similarity, Start capture vs GT rgb",
-    "clip_end": f"CLIP {CLIP_MODEL} cosine similarity, End capture vs GT rgb",
-    "clip_gain": "clip_end - clip_start",
-    "clip_final_rgb": f"CLIP {CLIP_MODEL} cosine similarity, Final snapshot rgb.png vs GT rgb",
-    "ue_pos_err_{x,y,z}_cm": "last MotionLog drone position - GT MotionLog drone position, UE world, cm "
-                             "(as clip_comparison.py)",
-    "ue_{pitch,yaw}_err_deg": "last MotionLog camera pitch/yaw - GT, deg (as clip_comparison.py)",
+    "img_start": "image score (repositioning_score combined, 0..1), Start capture vs target image",
+    "img_end": "same, End capture vs target image",
+    "img_gain": "img_end - img_start",
+    "img_final": "same, Final snapshot (simulation rgb.png / drone rgb.jpg) vs target image",
+    "img_<x>_global": "DINOv2 CLS cosine similarity, clipped to [0, 1]",
+    "img_<x>_overlap": "RANSAC inliers / min(keypoints target, keypoints query): share of the scene re-observed",
+    "img_<x>_alignment": "1 - median normalised displacement of the inliers / 0.25 (0 at a quarter image size)",
+    "img_<x>_inliers": "SuperPoint/LightGlue matches surviving MAGSAC fundamental-matrix RANSAC",
+    "img_<x>_median_disp_norm": "median displacement of the inliers, as a fraction of the image size",
+    "img_<x>_crop_rows": "set if an image was truncated: both images scored on these top rows only",
+    "img_<x>_px": "pixel error: median distance between the RANSAC-inlier matches of the target and the "
+                  "image, in pixels of the 1920x1080 frame (same for simulation and drone, so comparable "
+                  "across all data sets; includes rotation and translation misalignment)",
+    "drone overlay": "drone runs: matches inside the burned-in camera overlay boxes are ignored",
+    "ue_pos_err_{x,y,z}_cm": "last MotionLog drone position - GT MotionLog drone position, UE world, cm",
+    "ue_{pitch,yaw}_err_deg": "last MotionLog camera pitch/yaw - GT, deg",
     "error_over_time": "[time since start s, rotation error deg, translation error cm] every "
                        f"{MOTION_STEP}th MotionLog row",
     "rot_est_err_all_deg": "median over frames of |estimated - true rotation error| (dataLog vs MotionLog), deg",
@@ -600,8 +724,9 @@ def markdown_table(summary):
     """All trials (a timeout is a deliberate stop: the pose at the stop is the result)."""
     lines = ["| set | settled | n | alpha [deg] mean ± SD (RMSE) | alpha max [deg] | abs(t) [cm] mean ± SD (RMSE) | "
              "abs(t*) [cm] mean | abs(eps) [cm] mean ± SD (RMSE) | eps_lat [cm] mean ± SD (RMSE) | "
-             "eps_fwd [cm] mean ± SD (RMSE) | dead band [cm] | time to stop [s] | CLIP start -> end |",
-             "|" + "---|" * 13]
+             "eps_fwd [cm] mean ± SD (RMSE) | dead band [cm] | time to stop [s] | image score start -> end | "
+             "pixel error start -> end [px] |",
+             "|" + "---|" * 14]
     for name, s in summary.items():
         st = s["all"]
         def ms(k, nd=1):
@@ -614,7 +739,8 @@ def markdown_table(summary):
                      f"{ms('t_cm')} | {fmt(st.get('t_star_cm'), 'mean')} | {ms('eps_cm')} | "
                      f"{ms('eps_lat_cm')} | {ms('eps_fwd_cm')} | {fmt(st.get('deadband_cm'), 'mean')} | "
                      f"{fmt(st.get('duration_s'), 'mean')} | "
-                     f"{fmt(st.get('clip_start'), 'mean', nd=3)} -> {fmt(st.get('clip_end'), 'mean', nd=3)} |")
+                     f"{fmt(st.get('img_start'), 'mean', nd=3)} -> {fmt(st.get('img_end'), 'mean', nd=3)} | "
+                     f"{fmt(st.get('img_start_px'), 'median', nd=1)} -> {fmt(st.get('img_end_px'), 'median', nd=1)} |")
     return "\n".join(lines)
 
 
@@ -760,10 +886,22 @@ def fig_basin(df, out):
     plt.close(fig)
 
 
-def plot_trial_figures(row, tr, gt, out_dir):
+def score_label(name, row, key, base_key=None):
+    v = row.get(key, np.nan)
+    if v is None or not np.isfinite(v):
+        return name
+    gain = ""
+    if base_key is not None and np.isfinite(row.get(base_key, np.nan)):
+        gain = f", {v - row[base_key]:+.3f}"
+    px = row.get(f"{key}_px", np.nan)
+    px_txt = f", {px:.1f} px" if px is not None and np.isfinite(px) else ""
+    return f"{name}  (score {v:.3f}{gain}{px_txt})"
+
+
+def plot_trial_figures(row, tr, gt, out_dir, images_only=False):
     """
-    clip_comparison.py's per-trial figures:
-      <name>_images.png       GT | Start | End with the CLIP similarities
+    Per-trial figures:
+      <name>_images.png       GT | Start | End with the image scores
       <name>_translation.png  X, Y, Z of the trial path against the GT target
       <name>_rotation.png     camera pitch, yaw of the trial path against the GT target
     Returns {kind: path} of the figures written.
@@ -774,9 +912,8 @@ def plot_trial_figures(row, tr, gt, out_dir):
     figs = {}
 
     panels = [(gt.path / "rgb.png", f"Ground truth (GT{gt.id})")]
-    cs, ce = row.get("clip_start", np.nan), row.get("clip_end", np.nan)
-    panels.append((tr["image_start"], "Start" + (f"  (sim {cs:.4f})" if np.isfinite(cs) else "")))
-    panels.append((tr["image_end"], "End" + (f"  (sim {ce:.4f}, {ce - cs:+.4f})" if np.isfinite(ce) else "")))
+    panels.append((tr["image_start"], score_label("Start", row, "img_start")))
+    panels.append((tr["image_end"], score_label("End", row, "img_end", "img_start")))
     if all(Path(p).exists() for p, _ in panels):
         fig, axes = plt.subplots(1, 3, figsize=(21, 6))
         fig.suptitle(title, fontsize=16, fontweight="bold")
@@ -789,7 +926,7 @@ def plot_trial_figures(row, tr, gt, out_dir):
         fig.savefig(figs["images"], dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-    if tr["final_dir"] is None:
+    if tr["final_dir"] is None or images_only:
         return figs
     ml = pd.read_csv(tr["final_dir"] / "MotionLog.csv")
     target = pd.read_csv(gt.path / "MotionLog.csv").iloc[-1]
@@ -893,6 +1030,207 @@ def fig_curves(curves, df, out, set_name):
 
 
 # ============================================================
+# Real-drone runs
+# ============================================================
+
+def wrap_deg(a):
+    return (np.asarray(a, float) + 180.0) % 360.0 - 180.0
+
+
+def to_enu(lat, lon, alt, lat0, lon0, alt0):
+    east = np.radians(np.asarray(lon, float) - lon0) * EARTH_RADIUS_M * np.cos(np.radians(lat0))
+    north = np.radians(np.asarray(lat, float) - lat0) * EARTH_RADIUS_M
+    return east, north, np.asarray(alt, float) - alt0
+
+
+def drone_target(root, run_dir, log_text):
+    """(target image, target pose as motion-log columns or None, description)."""
+    gtd = root / "GroundTruthDrone"
+    m = re.fullmatch(r"idx(\d+)", run_dir.name)
+    if m and (gtd / "gerolfing.json").exists():
+        k = int(m.group(1))
+        e = json.loads((gtd / "gerolfing.json").read_text())[k]["images"]
+        visible = next((im["file_location"] for im in e if im["file_location"].endswith("visible.jpg")),
+                       e[0]["file_location"])
+        hits = sorted(gtd.rglob(Path(visible).name))
+        g = e[0]
+        pose = {"PosX": g["gps"][0], "PosY": g["gps"][1], "PosZ": g["gps"][2],
+                "Roll": g["drone_att"][DRONE_ATT_ROLL], "Pitch": g["drone_att"][DRONE_ATT_PITCH],
+                "Yaw": g["drone_att"][DRONE_ATT_YAW], "RollCam": g["gimbal_att"][DRONE_ATT_ROLL],
+                "PitchCam": g["gimbal_att"][DRONE_ATT_PITCH], "YawCam": g["gimbal_att"][DRONE_ATT_YAW]}
+        return (hits[0] if hits else None), pose, f"gerolfing.json entry {k}"
+    place = gtd / re.sub(r"\d+$", "", run_dir.name)
+    pngs = sorted(place.glob("GT*.png")) if place.is_dir() else []
+    if pngs:
+        logs = sorted(place.glob("*.csv"))
+        pose = None
+        if logs:
+            last = pd.read_csv(logs[0]).iloc[-1]
+            pose = {k: float(last[k]) for k in ("PosX", "PosY", "PosZ", "Roll", "Pitch", "Yaw",
+                                                "RollCam", "PitchCam", "YawCam")}
+        return pngs[0], pose, f"GroundTruthDrone/{place.name}"
+    m = re.search(r"target image: (\S+)", log_text)
+    if m:
+        hits = sorted(gtd.rglob(Path(m.group(1)).name))
+        return (hits[0] if hits else None), None, f"log target {Path(m.group(1)).name}"
+    return None, None, "unknown"
+
+
+def plot_drone_series(path, title, time, rows):
+    """rows: (label, values, target or None) - one panel each."""
+    fig, axes = plt.subplots(len(rows), 1, figsize=(14, 2.6 * len(rows)), sharex=True)
+    fig.suptitle(title, fontsize=13, fontweight="bold", color=INK, x=0.01, ha="left")
+    for ax, (label, values, target) in zip(axes, rows):
+        if target is not None:
+            ax.axhline(target, color=C_OK, lw=2, label="target (GT)")
+        ax.plot(time, values, color=C_FAIL, lw=1.2, label="drone")
+        ax.set_ylabel(label, fontsize=10, color=INK)
+        style(ax)
+    axes[0].legend(loc="upper right", frameon=False, fontsize=9, ncol=2)
+    axes[-1].set_xlabel("time since log start [s]", color=INK)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_drone_data_log(path, title, dl):
+    """The algorithm's own per-frame estimates: image error, rotation error, commands."""
+    t = (dl["send_ts"] - dl["send_ts"].iloc[0]).to_numpy()
+    px = dl["px_error"] if "px_error" in dl else np.hypot(dl["px_error_x"], dl["px_error_y"])
+    xyz = (("x", C_OK), ("y", C_FAIL), ("z", "#1baf7a"))
+    fig, axes = plt.subplots(4, 1, figsize=(14, 11), sharex=True)
+    fig.suptitle(title, fontsize=13, fontweight="bold", color=INK, x=0.01, ha="left")
+    axes[0].plot(t, px, color=INK, lw=1.2)
+    axes[0].set_yscale("log")
+    axes[0].set_ylabel("image error [px]", color=INK)
+    rot = dl[["rot_error_x", "rot_error_y", "rot_error_z"]].to_numpy(float)
+    for (a, c), col in zip(xyz, rot.T):
+        axes[1].plot(t, col, color=c, lw=1, label=a)
+    axes[1].plot(t, np.linalg.norm(rot, axis=1), color=INK, lw=1.4, label="|rot|")
+    axes[1].set_ylabel("estimated rotation\nerror [deg]", color=INK)
+    axes[1].legend(loc="upper right", frameon=False, fontsize=9, ncol=4)
+    for ax, prefix, label in ((axes[2], "v", "velocity command"), (axes[3], "w", "rotation-rate command")):
+        for a, c in xyz:
+            ax.plot(t, dl[f"{prefix}_{a}"], color=c, lw=1, label=f"{prefix}_{a}")
+        ax.set_ylabel(label, color=INK)
+        ax.legend(loc="upper right", frameon=False, fontsize=9, ncol=3)
+    for ax in axes:
+        ax.axhline(0, color=INK_MUTED, lw=0.8) if ax is not axes[0] else None
+        style(ax)
+    axes[-1].set_xlabel("time since first estimate [s]", color=INK)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_drone_images(path, title, target, start, end, row):
+    """Target | Start | End; truncated images are cropped to the rows all three have."""
+    imgs = [load_rgb(p) if p is not None and Path(p).exists() else (None, 0, False)
+            for p in (target, start, end)]
+    rows = min([h for _, h, _ in imgs if h > 0] or [0])
+    labels = ["Target (GT)" + ("" if target else "  (missing)"),
+              score_label("Start", row, "img_start"),
+              score_label("End", row, "img_end", "img_start")]
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+    fig.suptitle(title, fontsize=14, fontweight="bold", color=INK)
+    for ax, (a, _, _), lab in zip(axes, imgs, labels):
+        if a is not None:
+            ax.imshow(a[:rows])
+        ax.set_title(lab, fontsize=12, color=INK)
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def analyze_drone_runs(root, out, scorer, images_only=False):
+    """
+    Image comparison, algorithm plot and logged-pose plots for every drone run. A run without a
+    ground-truth target image (e.g. clear/ground) gets no image comparison and no image panel.
+    images_only: only the image comparison and image panel.
+    """
+    runs = []
+    for run_dir in sorted((root / "LogDataDrone").glob("*/*/")):
+        weather, name = run_dir.parent.name, run_dir.name
+        text = "\n".join(p.read_text(errors="replace") for p in run_dir.glob("log_*.txt"))
+        status = ("settled" if "Maintained target position" in text
+                  else "timed_out" if "Timed Out" in text else "unknown")
+        target, pose, source = drone_target(root, run_dir, text)
+        m = re.search(r"target image: (\S+)", text)
+        start = next(iter(sorted(run_dir.glob("images/imageStart*.png"))), None)
+        end = next(iter(sorted(run_dir.glob("images/imageEnd*.png"))), None)
+        mdir = root / "motionDrone" / weather / name
+        final = next(iter(sorted(mdir.glob("rgb.*"))), None) if mdir.is_dir() else None
+        run_out = out / weather
+        run_out.mkdir(parents=True, exist_ok=True)
+        tag = f"{weather}_{name}"
+        title = f"{weather} / {name}  ->  {target.name if target else 'target missing'}"
+
+        row = {"weather": weather, "run": name, "status": status, "target_source": source,
+               "target_image": target, "target_image_on_drone": m.group(1) if m else None,
+               "image_start": start, "image_end": end, "image_final": final}
+        figs = {}
+        if target is None:
+            print(f"[drone {tag}] no ground-truth image -> no image comparison")
+        else:
+            if scorer is not None:
+                add_image_scores(row, scorer, target, {"start": start, "end": end, "final": final},
+                                 exclude=DRONE_OVERLAY_BOXES)
+            figs["images"] = run_out / f"{tag}_images.png"
+            plot_drone_images(figs["images"], title, target, start, end, row)
+
+        dls = [] if images_only else sorted(run_dir.glob("dataLog_*.csv"))
+        if dls:
+            dl = pd.read_csv(dls[0])
+            dl.columns = dl.columns.str.strip()
+            if len(dl) > 1:
+                figs["algorithm"] = run_out / f"{tag}_algorithm.png"
+                plot_drone_data_log(figs["algorithm"], f"Algorithm estimates - {title}", dl)
+                px = dl["px_error"] if "px_error" in dl else np.hypot(dl["px_error_x"], dl["px_error_y"])
+                n = max(1, len(dl) // 20)
+                row.update({"frames": len(dl), "px_error_start": float(px.iloc[:n].median()),
+                            "px_error_end": float(px.iloc[-n:].median())})
+
+        mls = sorted(mdir.glob("motion_log*.csv")) if mdir.is_dir() and not images_only else []
+        if mls and pose is not None:
+            log = pd.read_csv(mls[0])
+            t = (log["Time"] - log["Time"].iloc[0]).to_numpy()
+            row["duration_s"] = float(t[-1])
+            figs["camera_rotation"] = run_out / f"{tag}_camera_rotation.png"
+            plot_drone_series(figs["camera_rotation"], f"Camera (gimbal) rotation vs target - {title}", t, [
+                ("camera pitch [deg]", log["PitchCam"], pose["PitchCam"]),
+                ("camera yaw [deg]", log["YawCam"], pose["YawCam"]),
+                ("camera roll [deg]", log["RollCam"], pose["RollCam"])])
+            figs["drone_rotation"] = run_out / f"{tag}_drone_rotation.png"
+            plot_drone_series(figs["drone_rotation"], f"Drone body rotation vs target - {title}", t, [
+                ("drone yaw [deg]", log["Yaw"], pose["Yaw"]),
+                ("drone pitch [deg]", log["Pitch"], pose["Pitch"]),
+                ("drone roll [deg]", log["Roll"], pose["Roll"])])
+            for k, c in (("camera_yaw", "YawCam"), ("camera_pitch", "PitchCam"), ("drone_yaw", "Yaw")):
+                row[f"{k}_err_start_deg"] = float(wrap_deg(log[c].iloc[0] - pose[c]))
+                row[f"{k}_err_end_deg"] = float(wrap_deg(log[c].iloc[-1] - pose[c]))
+            if not (pose["PosX"] == 0 and pose["PosY"] == 0):  # (0, 0) = no GPS (lab)
+                e, nn, u = to_enu(log["PosX"], log["PosY"], log["PosZ"], pose["PosX"], pose["PosY"], pose["PosZ"])
+                d = np.sqrt(e ** 2 + nn ** 2 + u ** 2)
+                figs["translation"] = run_out / f"{tag}_translation.png"
+                plot_drone_series(figs["translation"], f"Translation vs target (GPS) - {title}", t, [
+                    ("east [m]", e, 0.0), ("north [m]", nn, 0.0), ("up [m]", u, 0.0), ("distance [m]", d, 0.0)])
+                row.update({"gps_distance_start_m": float(d[0]), "gps_distance_end_m": float(d[-1])})
+        row["figures"] = figs
+        runs.append(row)
+        if target is not None:
+            sc = lambda k, f=".3f": "n/a" if not np.isfinite(row.get(k, np.nan)) else format(row[k], f)
+            print(f"[drone {tag}] {status} | image score {sc('img_start')} -> {sc('img_end')}, "
+                  f"pixel error {sc('img_start_px', '.1f')} -> {sc('img_end_px', '.1f')} px "
+                  f"(final snapshot {sc('img_final')}, {sc('img_final_px', '.1f')} px)")
+    return runs
+
+
+def flatten_drone(r):
+    return {k: (str(v) if isinstance(v, Path) else v) for k, v in r.items() if k != "figures"}
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -904,17 +1242,21 @@ def main():
     ap.add_argument("--run", type=Path, default=None,
                     help="older run folder without logs, e.g. data/motionLog5_03 (one set per weather subfolder)")
     ap.add_argument("--settle-px", type=float, default=1.5, help="--run layout: assumed settle threshold")
-    ap.add_argument("--no-clip", action="store_true", help="skip the CLIP similarities")
+    ap.add_argument("--mode", choices=["all", "plots", "images"], default="all",
+                    help="all: everything; plots: all analysis and plots, image scores only from the "
+                         "cache (no DINOv2/LightGlue); images: only the image comparison and image panels")
     ap.add_argument("--no-trial-plots", action="store_true",
-                    help="skip the per-trial image panel and translation/rotation plots")
+                    help="skip the per-trial figures (simulation: ~13 x 18 trials x 3 figures)")
+    ap.add_argument("--no-drone", action="store_true", help="skip the real-drone runs")
     args = ap.parse_args()
-    clip_scorer = None if args.no_clip else ClipScorer()
+    images_only = args.mode == "images"
 
     global BASE_SET
     if args.run is not None:
         args.root = args.run
     out = args.out or args.root / "analysis"
     (out / "figures").mkdir(parents=True, exist_ok=True)
+    scorer = ImageScorer(out, compute=args.mode != "plots")
 
     gts = load_ground_truths(args.root)
     if args.run is not None:
@@ -944,20 +1286,18 @@ def main():
             settle_px = float(tr["config"].get("settle-px", 1.5))
             row, curve, track = analyze_trial(tr, gt, settle_px)
             row["settle_px"] = settle_px
-            if clip_scorer is not None:
-                gt_rgb = gt.path / "rgb.png"
-                row["clip_start"] = clip_scorer.similarity(tr["image_start"], gt_rgb)
-                row["clip_end"] = clip_scorer.similarity(tr["image_end"], gt_rgb)
-                row["clip_gain"] = row["clip_end"] - row["clip_start"]
+            if scorer is not None:
                 final_rgb = tr["final_dir"] / "rgb.png" if tr["final_dir"] is not None else None
-                row["clip_final_rgb"] = clip_scorer.similarity(final_rgb, gt_rgb)
+                add_image_scores(row, scorer, gt.path / "rgb.png",
+                                 {"start": tr["image_start"], "end": tr["image_end"], "final": final_rgb})
             row["config"] = tr["config"]
             row["files"] = {"log": tr["data_log"].with_name(f"log_{tr['stamp']}.txt"),
                             "final_dir": tr["final_dir"], "gt_dir": gt.path,
                             "image_start": tr["image_start"], "image_end": tr["image_end"],
                             "matches": tr["matches"]}
             if not args.no_trial_plots:
-                row["files"].update(plot_trial_figures(row, tr, gt, out / "trials" / s))
+                row["files"].update(plot_trial_figures(row, tr, gt, out / "trials" / s,
+                                                       images_only=images_only))
             rows.append(row)
             if curve is not None:
                 curves[(s, tr["stamp"])] = curve
@@ -965,6 +1305,12 @@ def main():
                 tracks[(s, tr["stamp"])] = track
         d = [r for r in rows if r["set"] == s]
         print(f"[{s}] {len(d)} trials, {sum(r['status'] == 'settled' for r in d)} settled")
+
+    drone_runs = [] if args.no_drone else analyze_drone_runs(args.root, out / "drone", scorer, images_only)
+    scorer.save()
+    if drone_runs:
+        pd.DataFrame([flatten_drone(r) for r in drone_runs]).to_csv(
+            out / "drone_runs.csv", index=False, float_format="%.4f")
 
     df = pd.DataFrame([{k: v for k, v in r.items() if k not in ("config", "files")} for r in rows])
     ok = df["final_pose_source"] == "meta"
@@ -990,7 +1336,8 @@ def main():
     results = {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "root": args.root,
-        "clip_model": None if args.no_clip else CLIP_MODEL,
+        "image_score": IMAGE_SCORE,
+        "mode": args.mode,
         "definitions": DEFINITIONS,
         "ground_truths": {gt.name: {"id": gt.id, "cam_location_cm": gt.meta["cam_location_cm"],
                                     "cam_forward": gt.meta["cam_forward"],
@@ -999,6 +1346,7 @@ def main():
                           for gt in gts.values()},
         "sets": summary,
         "trials": trials_json,
+        "drone_runs": drone_runs,
     }
     (out / "results.json").write_text(json.dumps(jsonable(results), indent=2, ensure_ascii=False),
                                       encoding="utf-8")
@@ -1014,13 +1362,14 @@ def main():
     (out / "summary.md").write_text(encoding="utf-8", data=
         "All trials, error at the stop (settled or timed out). Values: mean ± SD (RMSE).\n\n" + md + "\n")
 
-    fig_dir = out / "figures"
-    fig_compensation(df, fig_dir)
-    fig_sets(df, fig_dir, sets)
-    fig_basin(df, fig_dir)
-    fig_estimators(df, tracks, fig_dir)
-    for s in sets:
-        fig_curves(curves, df, fig_dir, s)
+    if not images_only:
+        fig_dir = out / "figures"
+        fig_compensation(df, fig_dir)
+        fig_sets(df, fig_dir, sets)
+        fig_basin(df, fig_dir)
+        fig_estimators(df, tracks, fig_dir)
+        for s in sets:
+            fig_curves(curves, df, fig_dir, s)
 
     print("\n" + md.replace("±", "+-"))
     b = df[df["set"] == BASE_SET].dropna(subset=["alpha_deg"])
