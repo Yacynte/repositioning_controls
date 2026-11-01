@@ -52,7 +52,7 @@ Outputs in --out (default <root>/analysis):
     trials.csv, summary.csv, summary.md, figures/*.png
     trials/<set>/GT<k>_<ts>_{images,translation,rotation}.png   (GT | Start | End panel with
                    the image scores and path-vs-GT plots, one set per trial)
-    drone/<weather>/<run>_{images,algorithm,camera_rotation,drone_rotation,translation}.png
+    drone/<weather>/<weather>_<run>_{images,algorithm,camera_rotation,drone_rotation}.png
 
 Usage (from controls/):
     python analyze_final_motion.py                    # everything
@@ -118,6 +118,9 @@ DRONE_OVERLAY_BOXES = [(0.0, 0.0, 1340 / 1920, 320 / 1080),
 TRUNCATION_MARGIN_ROWS = 8  # rows dropped above the cut of a truncated (incompletely copied) PNG
 DRONE_ATT_ROLL, DRONE_ATT_PITCH, DRONE_ATT_YAW = 0, 1, 2  # order of gerolfing angle triplets
 EARTH_RADIUS_M = 6378137.0
+# Motion log cut-off [s] per drone run: the log keeps recording after the run, when the drone is
+# reset (gimbal pitch jumps back to 0 deg at 101.8 s / 103.2 s for clear idx1 / idx2)
+DRONE_LOG_END_S = {("clear", "idx1"): 100.0, ("clear", "idx2"): 100.0}
 
 # dataLog rot_error_{x,y,z} -> GT CV frame rotation vector: cv = sign * est[perm]
 # (fitted over all 48 signed axis permutations; the same mapping wins for every run)
@@ -1194,6 +1197,9 @@ def analyze_drone_runs(root, out, scorer, images_only=False):
         mls = sorted(mdir.glob("motion_log*.csv")) if mdir.is_dir() and not images_only else []
         if mls and pose is not None:
             log = pd.read_csv(mls[0])
+            t_end = DRONE_LOG_END_S.get((weather, name))
+            if t_end is not None:
+                log = log[log["Time"] - log["Time"].iloc[0] <= t_end].reset_index(drop=True)
             t = (log["Time"] - log["Time"].iloc[0]).to_numpy()
             row["duration_s"] = float(t[-1])
             figs["camera_rotation"] = run_out / f"{tag}_camera_rotation.png"
@@ -1209,12 +1215,11 @@ def analyze_drone_runs(root, out, scorer, images_only=False):
             for k, c in (("camera_yaw", "YawCam"), ("camera_pitch", "PitchCam"), ("drone_yaw", "Yaw")):
                 row[f"{k}_err_start_deg"] = float(wrap_deg(log[c].iloc[0] - pose[c]))
                 row[f"{k}_err_end_deg"] = float(wrap_deg(log[c].iloc[-1] - pose[c]))
+            # GPS distance is kept as a number only (no plot): without RTK the same GPS reading
+            # does not mean the same place, which is the problem the images are used to correct
             if not (pose["PosX"] == 0 and pose["PosY"] == 0):  # (0, 0) = no GPS (lab)
                 e, nn, u = to_enu(log["PosX"], log["PosY"], log["PosZ"], pose["PosX"], pose["PosY"], pose["PosZ"])
                 d = np.sqrt(e ** 2 + nn ** 2 + u ** 2)
-                figs["translation"] = run_out / f"{tag}_translation.png"
-                plot_drone_series(figs["translation"], f"Translation vs target (GPS) - {title}", t, [
-                    ("east [m]", e, 0.0), ("north [m]", nn, 0.0), ("up [m]", u, 0.0), ("distance [m]", d, 0.0)])
                 row.update({"gps_distance_start_m": float(d[0]), "gps_distance_end_m": float(d[-1])})
         row["figures"] = figs
         runs.append(row)

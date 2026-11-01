@@ -169,7 +169,7 @@ On Windows, set `$env:PYTHONIOENCODING = "utf-8"` if the console fails to print 
 | `image_scores.json` | cache of the image comparisons (see above) |
 | `figures/` | summary figures (see below) |
 | `trials/<set>/` | per simulation trial: `GT<k>_<ts>_images.png` (target, Start and End with image score and pixel error), `_translation.png` and `_rotation.png` (trajectory vs target) |
-| `drone/<weather>/` | per drone run: `<run>_images.png`, `_algorithm.png` (the algorithm's per-frame image error, rotation estimate and commands), `_camera_rotation.png`, `_drone_rotation.png`, `_translation.png` (GPS, where available) |
+| `drone/<weather>/` | per drone run: `<weather>_<run>_images.png`, `_algorithm.png` (the algorithm's per-frame image error, rotation estimate and commands), `_camera_rotation.png`, `_drone_rotation.png`. No translation plot: without RTK the same GPS reading does not mean the same place (the GPS distance to the target is still listed in `drone_runs.csv`) |
 
 Summary figures in `figures/`:
 
