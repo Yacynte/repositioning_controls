@@ -55,7 +55,7 @@ finalMotion/
 # Ignore logs completely (also covers run folders like /logData5_05fog)
 /log*
 /finalMotion.7z
-
+/analysis.7z
 # Python bytecode
 __pycache__/
 *.pyc
