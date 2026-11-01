@@ -40,7 +40,7 @@ STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 class TwoStageScorer:
     def __init__(self, device, dino="dinov2_vitb14", dino_size=448, max_kpts=2048,
-                 resize=1024, ransac_px=1.5, min_inliers=15, d_max=0.25,
+                 resize=None, ransac_px=1.5, min_inliers=15, d_max=0.25,
                  weights=(0.2, 0.4, 0.4), dino_repo=None):
         self.dev = device
         self.dino_size = dino_size
@@ -69,7 +69,8 @@ class TwoStageScorer:
                           mode="bilinear", align_corners=False)[0]
         x = ((x - MEAN) / STD)[None].to(self.dev)
         g = F.normalize(self.dino(x), dim=-1)[0]
-        # Stage 2: local features (keypoints returned in original pixel coords)
+        # Stage 2: local features (keypoints returned in original pixel coords;
+        # resize=None detects them at full resolution)
         feats = self.extractor.extract(img.to(self.dev), resize=self.resize)
         entry = {"img": img, "size": np.array([W, H], dtype=np.float64), "g": g, "feats": feats}
         self._cache[path] = entry
@@ -167,7 +168,8 @@ def main():
                     help="dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14 | dinov2_vitg14")
     ap.add_argument("--dino-repo", help="path to a local clone of facebookresearch/dinov2")
     ap.add_argument("--max-kpts", type=int, default=2048)
-    ap.add_argument("--resize", type=int, default=1024, help="long side for SuperPoint")
+    ap.add_argument("--resize", type=int, default=None,
+                    help="long side for SuperPoint (default: full resolution, no resizing)")
     ap.add_argument("--ransac-px", type=float, default=1.5)
     ap.add_argument("--min-inliers", type=int, default=15)
     ap.add_argument("--d-max", type=float, default=0.25,

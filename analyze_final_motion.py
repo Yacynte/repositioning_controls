@@ -108,6 +108,9 @@ DENSE_STRIDE = 4         # pixel stride for dense depth sampling (overlap, fallb
 MOTION_STEP = 5          # use every n-th MotionLog row for the error-over-time curves
 META_MISMATCH_CM = 5.0   # Final meta.json vs last MotionLog pose; above this the meta is stale
 IMAGE_SCORE = "repositioning_score.TwoStageScorer (DINOv2 + SuperPoint/LightGlue)"
+# Scorer settings. resize=None: keypoints are detected on the full-resolution image, so the pixel
+# error is in the image's own pixels. Cached scores made with other settings are discarded.
+IMAGE_SCORE_SETTINGS = {"weights": [0.3, 0, 0.7], "resize": None}
 
 # Burned-in on-screen overlay of the drone camera stream, (x0, y0, x1, y1) in normalised image
 # coordinates (measured on 1920x1080 frames, ~15 px margin): grey info box, "Live Stream" box,
@@ -257,7 +260,11 @@ class ImageScorer:
     def __init__(self, out_dir, compute=True):
         self.out_dir = Path(out_dir)
         self.cache_file = self.out_dir / "image_scores.json"
-        self.cache = json.loads(self.cache_file.read_text()) if self.cache_file.exists() else {}
+        data = json.loads(self.cache_file.read_text()) if self.cache_file.exists() else {}
+        if data and data.get("settings") != IMAGE_SCORE_SETTINGS:
+            print(f"{self.cache_file} was computed with other scorer settings -> discarded")
+            data = {}
+        self.cache = data.get("scores", {})
         self.compute = compute
         self.scorer = None
 
@@ -273,7 +280,8 @@ class ImageScorer:
                     "or run without image scoring:  python analyze_final_motion.py --mode plots")
             device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"Image score: {IMAGE_SCORE} on {device}")
-            self.scorer = TwoStageScorer(device, weights=(0.3, 0, 0.7))
+            self.scorer = TwoStageScorer(device, weights=tuple(IMAGE_SCORE_SETTINGS["weights"]),
+                                         resize=IMAGE_SCORE_SETTINGS["resize"])
         return self.scorer
 
     def _crop(self, path, rows):
@@ -320,7 +328,8 @@ class ImageScorer:
 
     def save(self):
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_file.write_text(json.dumps(jsonable(self.cache), indent=1))
+        self.cache_file.write_text(json.dumps(
+            {"settings": IMAGE_SCORE_SETTINGS, "scores": jsonable(self.cache)}, indent=1))
 
 
 def add_image_scores(row, scorer, target, images, exclude=None):
