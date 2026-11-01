@@ -273,7 +273,7 @@ class ImageScorer:
                     "or run without image scoring:  python analyze_final_motion.py --mode plots")
             device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"Image score: {IMAGE_SCORE} on {device}")
-            self.scorer = TwoStageScorer(device)
+            self.scorer = TwoStageScorer(device, weights=(0.3, 0, 0.7))
         return self.scorer
 
     def _crop(self, path, rows):
